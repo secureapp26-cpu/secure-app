@@ -1235,6 +1235,577 @@ export class UserLimitGuard implements CanActivate {
 - ✅ Soft delete para auditoría
 - ✅ Logs de auditoría en MongoDB
 
+---
+
+### Estrategia de Rate Limiting
+
+#### Problema Identificado
+
+El rate limiting por IP con límite de **10 peticiones/minuto es demasiado restrictivo** para:
+
+1. **Navegación normal**: Usuario navega por home, módulos, dashboards
+   - Cada vista puede hacer 3-5 peticiones (datos, permisos, configuración)
+   - En 60 segundos puede visitar 3-4 secciones = 12-20 peticiones
+   - **Resultado**: Usuario legítimo bloqueado ❌
+
+2. **Sincronización offline**: Guardia con 280 registros pendientes
+   - Al conectarse envía todo en batch
+   - Excede límite inmediatamente
+   - **Resultado**: Datos no se sincronizan ❌
+
+#### Solución: Rate Limiting Diferenciado
+
+**Estrategia**: Diferentes límites según tipo de endpoint y usuario autenticado.
+
+##### 1. Rate Limiting por Usuario (no por IP)
+
+```typescript
+@Injectable()
+export class UserRateLimitGuard extends ThrottlerGuard {
+  protected getTracker(req: Request): Promise<string> {
+    const user = req.user as User;
+    
+    // Si está autenticado, limitar por user_id
+    if (user?.id) {
+      return Promise.resolve(`user:${user.tenant_id}:${user.id}`);
+    }
+    
+    // Si no está autenticado (login, registro), limitar por IP
+    const ip = req.headers['x-forwarded-for'] || req.ip;
+    return Promise.resolve(`ip:${ip}`);
+  }
+}
+```
+
+**Ventajas**:
+- ✅ Múltiples usuarios en misma IP (oficina, WiFi público) no se afectan
+- ✅ Límite por usuario autenticado
+- ✅ Endpoints públicos siguen limitados por IP
+
+##### 2. Límites por Tipo de Endpoint
+
+| Tipo de Endpoint | Rate Limit | Razón |
+|------------------|------------|-------|
+| **Autenticación** | | |
+| `/auth/login` | 5 req/min por IP | Prevenir fuerza bruta |
+| `/auth/register` | 3 req/min por IP | Prevenir spam de cuentas |
+| `/auth/refresh` | 10 req/min por usuario | Renovación de tokens |
+| **Navegación Normal** | | |
+| `/api/*` (general) | 200 req/min por usuario | Navegación fluida en SPA |
+| `GET /api/*` | 300 req/min por usuario | Lecturas más permisivas |
+| `POST/PUT/DELETE /api/*` | 100 req/min por usuario | Escrituras más controladas |
+| **Sincronización Offline** | | |
+| `/sync/batch` | 500 req/min por usuario | Sincronización masiva |
+| `/sync/status` | Sin límite | Solo lectura, sin impacto |
+| **Reportes** | | |
+| `/reports/generate` | 10 req/min por usuario | Proceso pesado |
+| `/reports/download` | 50 req/min por usuario | Descarga de reportes |
+| **Health & Monitoring** | | |
+| `/health` | Sin límite | Monitoreo externo |
+| `/metrics` | Sin límite | Prometheus scraping |
+
+##### 3. Implementación por Endpoint
+
+```typescript
+// Endpoints de autenticación (limitados por IP)
+@Post('login')
+@UseGuards(RateLimitGuard)  // Por IP
+@Throttle({ default: { limit: 5, ttl: 60000 } })
+async login(@Body() dto: LoginDto) {}
+
+// Endpoints normales (limitados por usuario)
+@Get('spaces')
+@UseGuards(JwtAuthGuard, UserRateLimitGuard)
+@Throttle({ default: { limit: 200, ttl: 60000 } })
+async getSpaces(@CurrentUser() user: User) {}
+
+// Sincronización offline (límite alto)
+@Post('sync/batch')
+@UseGuards(JwtAuthGuard, UserRateLimitGuard)
+@Throttle({ default: { limit: 500, ttl: 60000 } })
+async syncBatch(@Body() dto: SyncBatchDto) {
+  // Validar máximo 100 registros por petición
+  if (dto.records.length > 100) {
+    throw new BadRequestException('Maximum 100 records per batch');
+  }
+  return this.syncService.processBatch(dto.records);
+}
+
+// Health check (sin límite)
+@Get('health')
+@SkipThrottle()
+async healthCheck() {
+  return { status: 'ok' };
+}
+```
+
+##### 4. Configuración Global
+
+```typescript
+// security.module.ts
+ThrottlerModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => [
+    {
+      name: 'default',
+      ttl: 60000,      // 60 segundos
+      limit: 200,      // 200 peticiones por defecto
+    },
+    {
+      name: 'strict',  // Para endpoints sensibles
+      ttl: 60000,
+      limit: 5,
+    },
+    {
+      name: 'relaxed', // Para sincronización
+      ttl: 60000,
+      limit: 500,
+    },
+  ],
+})
+```
+
+##### 5. Estrategia de Sincronización en Cliente
+
+```typescript
+// App móvil - Sincronización inteligente
+async syncOfflineData() {
+  const pendingRecords = await getOfflineRecords(); // Ej: 280 registros
+  
+  // Dividir en batches de 100
+  const batches = chunk(pendingRecords, 100); // [100, 100, 80]
+  
+  for (const batch of batches) {
+    try {
+      await api.post('/sync/batch', { records: batch });
+      await markAsSynced(batch);
+      
+      // Pequeña pausa entre batches para no saturar
+      if (batches.length > 1) {
+        await sleep(200); // 200ms entre batches
+      }
+    } catch (error) {
+      if (error.status === 429) {
+        // Rate limit excedido, esperar y reintentar
+        await sleep(2000);
+        await this.retryBatch(batch);
+      } else {
+        // Otro error, marcar para revisión
+        await markAsConflict(batch, error);
+      }
+    }
+  }
+}
+```
+
+#### Protección Adicional: Bloqueo por Comportamiento Sospechoso
+
+El rate limiting NO bloquea permanentemente. El **bloqueo permanente** solo ocurre cuando:
+
+```typescript
+// SecurityService - Bloqueo automático después de 5 actividades sospechosas
+markSuspiciousIP(ip: string): void {
+  const count = (this.suspiciousIPs.get(ip) || 0) + 1;
+  
+  if (count >= 5) {
+    this.blockIP(ip);  // Bloqueo permanente
+  }
+}
+```
+
+**Actividades sospechosas**:
+1. Request muy grande (>10MB)
+2. Path traversal (`../../etc/passwd`)
+3. SQL injection (`' UNION SELECT`)
+4. XSS attempt (`<script>`)
+5. Code injection (`exec()`)
+6. Bots no autorizados
+
+**Flujo**:
+```
+Usuario normal excede rate limit:
+└─ Recibe 429 Too Many Requests
+└─ Espera 60 segundos
+└─ Puede continuar normalmente
+
+Usuario malicioso:
+├─ Intenta 5 ataques diferentes
+└─ IP bloqueada permanentemente (403 Forbidden)
+    └─ Requiere desbloqueo manual por admin
+```
+
+#### Variables de Entorno
+
+```bash
+# .env
+# Rate Limiting
+THROTTLE_TTL=60000                    # 60 segundos
+THROTTLE_DEFAULT_LIMIT=200            # Navegación normal
+THROTTLE_STRICT_LIMIT=5               # Login, registro
+THROTTLE_RELAXED_LIMIT=500            # Sincronización
+
+# Security
+SECURITY_MAX_REQUEST_SIZE=10485760    # 10MB
+SECURITY_SUSPICIOUS_THRESHOLD=5       # Intentos antes de bloquear
+```
+
+#### Monitoreo y Ajustes
+
+**Métricas a monitorear**:
+- Tasa de 429 errors por endpoint
+- Usuarios legítimos bloqueados
+- Tiempo promedio de sincronización
+- IPs bloqueadas automáticamente
+
+**Ajustes recomendados después de producción**:
+- Si muchos 429 en navegación → Aumentar límite default a 300
+- Si sincronización lenta → Aumentar límite relaxed a 1000
+- Si muchos ataques → Reducir threshold de bloqueo a 3
+
+---
+
+### Sistema de Observabilidad: Grafana Stack
+
+#### Estrategia: Enfoque Híbrido
+
+**Decisión**: Combinar Grafana Stack con MongoDB para diferentes propósitos
+
+```
+┌─────────────────────────────────────────────┐
+│          Estrategia Híbrida                 │
+├─────────────────────────────────────────────┤
+│                                             │
+│  📊 Métricas → Prometheus → Grafana        │
+│     - Performance, latencias, throughput    │
+│     - Uso de recursos (CPU, memoria)        │
+│     - Métricas de negocio (rondas, alertas)│
+│                                             │
+│  📝 Logs Operacionales → Loki → Grafana    │
+│     - Errores, warnings, debug              │
+│     - Logs de aplicación en tiempo real     │
+│     - Búsqueda y filtrado rápido            │
+│                                             │
+│  🔍 Logs de Auditoría → MongoDB            │
+│     - Compliance, legal                     │
+│     - Retención larga (1+ años)             │
+│     - Histórico inmutable                   │
+│                                             │
+│  🔒 Logs de Seguridad → MongoDB + Grafana  │
+│     - Ataques, bloqueos                     │
+│     - Dashboard de seguridad                │
+│     - Alertas en tiempo real                │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+**Razón**: 
+- ✅ Grafana para observabilidad y debugging en tiempo real
+- ✅ MongoDB para auditoría, compliance y retención larga
+- ✅ Mejor rendimiento y costos optimizados
+
+#### Componentes del Stack
+
+##### 1. Prometheus - Métricas
+
+**Métricas de Sistema**:
+- `http_requests_total` - Total de requests HTTP
+- `http_request_duration_seconds` - Duración de requests
+- `nodejs_heap_size_used_bytes` - Uso de memoria
+- `nodejs_eventloop_lag_seconds` - Lag del event loop
+
+**Métricas de Negocio**:
+- `rounds_created_total` - Rondas creadas por tenant
+- `rounds_completed_total` - Rondas completadas
+- `checkpoints_validated_total` - Checkpoints validados (GPS/QR/NFC)
+- `alerts_created_total` - Alertas creadas por tipo/severidad
+- `sync_queue_size` - Tamaño de cola de sincronización
+- `sync_success_rate` - Tasa de éxito de sincronización
+- `active_users` - Usuarios activos por tenant
+
+**Métricas de Seguridad**:
+- `rate_limit_exceeded_total` - Rate limits excedidos
+- `ips_blocked_total` - IPs bloqueadas
+- `auth_failures_total` - Fallos de autenticación
+
+##### 2. Loki - Logs Centralizados
+
+**Niveles**: error, warn, info, debug
+
+**Labels para filtrado**:
+- `app`, `environment`, `tenant_id`, `user_id`, `level`, `context`
+
+##### 3. Grafana - Dashboards
+
+**Dashboards a crear**:
+
+1. **System Overview**: Health general, requests/sec, latencia, errores
+2. **Business Metrics**: Rondas, checkpoints, alertas, usuarios activos
+3. **Performance**: Latencia por endpoint, queries lentas, event loop
+4. **Security**: Rate limits, IPs bloqueadas, intentos de login
+5. **Tenant Dashboard**: Métricas por tenant específico
+6. **Sync Dashboard**: Cola de sincronización, tasa de éxito/fallo
+
+#### Dependencias NPM
+
+```json
+{
+  "dependencies": {
+    "@willsoto/nestjs-prometheus": "^6.0.0",
+    "prom-client": "^15.1.0",
+    "winston": "^3.11.0",
+    "winston-loki": "^6.0.8"
+  }
+}
+```
+
+#### Docker Compose - Servicios de Monitoreo
+
+Agregar al `docker-compose.yml`:
+
+```yaml
+# Servicios de Monitoreo
+prometheus:
+  image: prom/prometheus:latest
+  container_name: security-app-prometheus
+  restart: unless-stopped
+  ports:
+    - '9090:9090'
+  volumes:
+    - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    - prometheus_data:/prometheus
+  command:
+    - '--config.file=/etc/prometheus/prometheus.yml'
+    - '--storage.tsdb.retention.time=30d'
+  networks:
+    - security-app-network
+
+loki:
+  image: grafana/loki:latest
+  container_name: security-app-loki
+  restart: unless-stopped
+  ports:
+    - '3100:3100'
+  volumes:
+    - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml
+    - loki_data:/loki
+  command: -config.file=/etc/loki/local-config.yaml
+  networks:
+    - security-app-network
+
+promtail:
+  image: grafana/promtail:latest
+  container_name: security-app-promtail
+  restart: unless-stopped
+  volumes:
+    - ./logs:/var/log/app
+    - ./monitoring/promtail/promtail-config.yml:/etc/promtail/config.yml
+  command: -config.file=/etc/promtail/config.yml
+  networks:
+    - security-app-network
+
+grafana:
+  image: grafana/grafana:latest
+  container_name: security-app-grafana
+  restart: unless-stopped
+  ports:
+    - '3001:3000'
+  environment:
+    - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    - GF_USERS_ALLOW_SIGN_UP=false
+  volumes:
+    - grafana_data:/var/lib/grafana
+    - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+  networks:
+    - security-app-network
+
+# Agregar volúmenes
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+```
+
+#### Estructura de Archivos
+
+```
+monitoring/
+├── prometheus/
+│   └── prometheus.yml
+├── loki/
+│   └── loki-config.yml
+├── promtail/
+│   └── promtail-config.yml
+└── grafana/
+    └── provisioning/
+        ├── datasources/
+        │   └── datasources.yml
+        └── dashboards/
+            ├── dashboards.yml
+            ├── system-overview.json
+            ├── business-metrics.json
+            ├── performance.json
+            ├── security.json
+            ├── tenant.json
+            └── sync.json
+
+src/core/
+├── logging/
+│   ├── logging.module.ts
+│   ├── services/
+│   │   ├── logger.service.ts
+│   │   └── mongodb-logger.service.ts
+│   ├── interceptors/
+│   │   └── http-logging.interceptor.ts
+│   └── decorators/
+│       └── log-execution.decorator.ts
+└── metrics/
+    ├── metrics.module.ts
+    ├── services/
+    │   └── metrics.service.ts
+    └── decorators/
+        └── track-metric.decorator.ts
+```
+
+#### Variables de Entorno
+
+```bash
+# Logging
+LOG_LEVEL=info
+LOG_TO_FILE=true
+LOG_TO_LOKI=true
+LOKI_HOST=http://localhost:3100
+
+# Grafana
+GRAFANA_ADMIN_PASSWORD=secure_password_here
+
+# Métricas
+METRICS_ENABLED=true
+PROMETHEUS_PORT=9090
+```
+
+#### Scripts NPM
+
+```json
+{
+  "scripts": {
+    "monitoring:up": "docker compose up -d prometheus loki promtail grafana",
+    "monitoring:down": "docker compose stop prometheus loki promtail grafana",
+    "monitoring:logs": "docker compose logs -f prometheus loki promtail grafana",
+    "grafana:open": "open http://localhost:3001",
+    "prometheus:open": "open http://localhost:9090"
+  }
+}
+```
+
+#### Implementación en NestJS
+
+##### Módulo de Métricas
+
+```typescript
+// src/core/metrics/metrics.module.ts
+import { Module } from '@nestjs/common';
+import { PrometheusModule } from '@willsoto/nestjs-prometheus';
+
+@Module({
+  imports: [
+    PrometheusModule.register({
+      defaultMetrics: { enabled: true },
+      path: '/metrics',
+      defaultLabels: { app: 'security-app' },
+    }),
+  ],
+})
+export class MetricsModule {}
+```
+
+##### Uso en Servicios
+
+```typescript
+// Ejemplo en rounds.service.ts
+import { Counter, Histogram } from 'prom-client';
+import { InjectMetric } from '@willsoto/nestjs-prometheus';
+
+@Injectable()
+export class RoundsService {
+  constructor(
+    @InjectMetric('rounds_created_total') 
+    private roundsCounter: Counter,
+    @InjectMetric('round_execution_duration_seconds') 
+    private roundDuration: Histogram,
+  ) {}
+
+  async createRound(dto: CreateRoundDto) {
+    const timer = this.roundDuration.startTimer();
+    try {
+      const round = await this.roundRepo.save(dto);
+      this.roundsCounter.inc({ tenant_id: dto.tenant_id });
+      return round;
+    } finally {
+      timer();
+    }
+  }
+}
+```
+
+#### Plan de Implementación
+
+**Fase 1: Setup Básico** (1-2 días)
+- Crear estructura de carpetas `monitoring/`
+- Crear archivos de configuración
+- Actualizar docker-compose.yml
+- Instalar dependencias NPM
+
+**Fase 2: Integración de Métricas** (2-3 días)
+- Implementar MetricsModule
+- Crear decorators para tracking
+- Integrar en servicios clave
+- Configurar endpoint /metrics
+
+**Fase 3: Integración de Logs** (2-3 días)
+- Implementar LoggingModule con Winston
+- Configurar transporte a Loki
+- Implementar interceptores HTTP
+- Mantener logs de auditoría en MongoDB
+
+**Fase 4: Dashboards** (2-3 días)
+- Crear datasources en Grafana
+- Diseñar 6 dashboards principales
+- Configurar variables y filtros
+- Configurar auto-refresh
+
+**Fase 5: Alertas** (1-2 días)
+- Configurar alertas en Grafana
+- Integrar con Slack/Email
+- Definir umbrales críticos
+
+**Fase 6: Testing y Docs** (1 día)
+- Probar dashboards
+- Verificar métricas y logs
+- Documentar acceso y uso
+
+**Tiempo total**: 9-14 días
+
+#### Beneficios
+
+| Beneficio | Impacto |
+|-----------|---------|
+| **Visibilidad** | Dashboards en tiempo real |
+| **Debugging** | Logs centralizados con búsqueda rápida |
+| **Proactividad** | Alertas antes de problemas |
+| **Performance** | Identificar cuellos de botella |
+| **Compliance** | Auditoría completa en MongoDB |
+| **Profesionalismo** | Stack enterprise-grade |
+
+#### Consideraciones
+
+- **Recursos**: ~500MB RAM adicionales
+- **Retención**: 30 días en Prometheus/Loki, 1+ año en MongoDB
+- **Seguridad**: Proteger /metrics con autenticación en producción
+- **Backup**: Incluir volúmenes en estrategia de backup
+
+---
+
 ### Performance Targets
 
 - API response time: < 200ms (p95)
